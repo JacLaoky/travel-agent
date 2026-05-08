@@ -55,7 +55,10 @@ public class AgentService {
         log.debug("Session cleared: {}", sessionId);
     }
 
-    public record AgentResult(String answer, int toolCallCount) {}
+    public record AgentResult(String answer, int toolCallCount, int evalScore) {}
+
+    // 自评结果：分数(1-5) + 批评意见
+    private record EvalResult(int score, String critique) {}
 
     // ─────────────────────────────────────────────────────────
     // 主入口：支持多轮对话
@@ -101,14 +104,49 @@ public class AgentService {
             String finishReason = choice.get("finish_reason").asText();
             log.debug("finish_reason={}, toolCalls so far={}", finishReason, toolCallCount.get());
 
-            // ② 最终答案：存入历史并返回
+            // ② 最终答案：自评 → 不达标就重新生成 → 返回
             if ("stop".equals(finishReason) || !message.has("tool_calls")) {
                 String answer = message.get("content").asText();
                 ObjectNode finalMsg = objectMapper.createObjectNode();
                 finalMsg.put("role", "assistant");
                 finalMsg.put("content", answer);
                 messages.add(finalMsg);
-                return new AgentResult(answer, toolCallCount.get());
+
+                // ── Reflexion 自评循环 ────────────────────────────
+                int evalScore     = 5;
+                int maxEvalRetries = 2;
+
+                for (int evalAttempt = 0; evalAttempt < maxEvalRetries; evalAttempt++) {
+                    EvalResult eval = selfEvaluate(userMessage, answer);
+                    evalScore = eval.score();
+                    log.debug("自评 {}/5：{}", eval.score(), eval.critique());
+
+                    if (eval.score() >= 3) break;   // 通过，不重试
+
+                    // 分数不足 → 把批评加进对话，让 LLM 重写答案
+                    // 注意：不重新调工具，工具数据已经在 messages 历史里
+                    log.debug("自评未通过（{}分），重新生成答案...", eval.score());
+                    ObjectNode critiqueMsg = objectMapper.createObjectNode();
+                    critiqueMsg.put("role", "user");
+                    critiqueMsg.put("content",
+                        "你刚才的回答不够完整：" + eval.critique() +
+                        "。请基于已有的查询结果重新给出更完整准确的回答。");
+                    messages.add(critiqueMsg);
+
+                    String retryBody   = callDeepSeek(messages);
+                    JsonNode retryMsg  = objectMapper.readTree(retryBody)
+                                            .get("choices").get(0).get("message");
+
+                    if (!retryMsg.has("tool_calls") && retryMsg.has("content")) {
+                        answer = retryMsg.get("content").asText();
+                        ObjectNode retryAssistant = objectMapper.createObjectNode();
+                        retryAssistant.put("role", "assistant");
+                        retryAssistant.put("content", answer);
+                        messages.add(retryAssistant);
+                    }
+                }
+
+                return new AgentResult(answer, toolCallCount.get(), evalScore);
             }
 
             // ③ 把 assistant 的工具调用意图存入历史
@@ -157,7 +195,7 @@ public class AgentService {
             }
         }
 
-        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount.get());
+        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount.get(), 0);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -207,6 +245,41 @@ public class AgentService {
             messages.clear();
             messages.add(systemMsg);
             messages.addAll(toKeep);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Reflexion 自评：让 LLM 给自己的答案打 1-5 分
+    // 返回 EvalResult(score, critique)
+    // ─────────────────────────────────────────────────────────
+    private EvalResult selfEvaluate(String userQuestion, String answer) {
+        try {
+            String truncated = answer.length() > 600 ? answer.substring(0, 600) + "..." : answer;
+            String prompt = String.format(
+                "你是旅行助手质检员。评估以下回答是否高质量。\n\n" +
+                "用户问题：%s\n" +
+                "Agent回答：%s\n\n" +
+                "评估标准：\n" +
+                "1. 是否包含具体数字（汇率/票价/温度）？\n" +
+                "2. 用户问了多个问题时，是否全部回答了？\n" +
+                "3. 有无明显遗漏或含糊其辞？\n\n" +
+                "只输出 JSON，格式：{\"score\": 1-5, \"critique\": \"一句话说明不足，满分写完整准确\"}",
+                userQuestion, truncated
+            );
+
+            String raw = callDeepSeekSimple(prompt);
+            // 去掉 LLM 可能包裹的 markdown 代码块
+            String json = raw.trim()
+                             .replaceAll("(?s)```json\\s*", "")
+                             .replaceAll("```", "")
+                             .trim();
+            JsonNode node = objectMapper.readTree(json);
+            return new EvalResult(node.get("score").asInt(), node.get("critique").asText());
+
+        } catch (Exception e) {
+            // 解析失败默认通过，不影响主流程
+            log.warn("自评解析失败，默认通过: {}", e.getMessage());
+            return new EvalResult(4, "自评解析失败");
         }
     }
 

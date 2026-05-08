@@ -4,13 +4,15 @@ public class ChatResponse {
 
     private String answer;
     private int toolCallCount;
+    private int evalScore;
 
-    // 构造函数：类比 Python 的 __init__
-    public ChatResponse(String answer, int toolCallCount) {
-        this.answer = answer;
+    public ChatResponse(String answer, int toolCallCount, int evalScore) {
+        this.answer       = answer;
         this.toolCallCount = toolCallCount;
+        this.evalScore    = evalScore;
     }
 
     public String getAnswer()      { return answer; }
     public int getToolCallCount()  { return toolCallCount; }
+    public int getEvalScore()      { return evalScore; }
 }

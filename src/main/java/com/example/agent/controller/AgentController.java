@@ -29,10 +29,10 @@ public class AgentController {
                     ? request.getSessionId()
                     : "default";
             AgentService.AgentResult result = agentService.chat(request.getMessage(), sessionId);
-            return ResponseEntity.ok(new ChatResponse(result.answer(), result.toolCallCount()));
+            return ResponseEntity.ok(new ChatResponse(result.answer(), result.toolCallCount(), result.evalScore()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
-                    .body(new ChatResponse("服务器错误：" + e.getMessage(), 0));
+                    .body(new ChatResponse("服务器错误：" + e.getMessage(), 0, 0));
         }
     }
 

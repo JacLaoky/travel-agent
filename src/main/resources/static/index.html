@@ -129,19 +129,20 @@
     margin: 6px 0;
   }
 
-  /* 工具调用徽章 */
+  /* 工具调用 + 评分徽章 */
   .tool-badge {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     background: #e8f5e9;
     color: #2e7d32;
     font-size: 11px;
-    padding: 3px 8px;
+    padding: 3px 10px;
     border-radius: 12px;
     margin-bottom: 8px;
     border: 1px solid #c8e6c9;
   }
+  .eval-score { color: #f57c00; font-weight: 600; }
 
   /* 加载动画 */
   .loading-bubble {
@@ -321,7 +322,7 @@
     .then(r => r.json())
     .then(data => {
       removeLoading(loadingId);
-      appendMessage('assistant', data.answer, data.toolCallCount);
+      appendMessage('assistant', data.answer, data.toolCallCount, data.evalScore);
     })
     .catch(err => {
       removeLoading(loadingId);
@@ -335,7 +336,7 @@
   }
 
   // ── DOM 工具 ─────────────────────────────────────────────────
-  function appendMessage(role, text, toolCallCount) {
+  function appendMessage(role, text, toolCallCount, evalScore) {
     const container = document.getElementById('messages');
 
     const msg = document.createElement('div');
@@ -348,11 +349,17 @@
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
 
-    // 工具调用徽章（仅 assistant）
-    if (role === 'assistant' && toolCallCount > 0) {
+    // 工具调用 + 评分徽章（仅 assistant）
+    if (role === 'assistant' && (toolCallCount > 0 || evalScore > 0)) {
       const badge = document.createElement('div');
       badge.className = 'tool-badge';
-      badge.innerHTML = `🔧 调用了 ${toolCallCount} 个工具`;
+      let html = '';
+      if (toolCallCount > 0) html += `🔧 ${toolCallCount} 个工具`;
+      if (evalScore > 0) {
+        const stars = '⭐'.repeat(Math.min(evalScore, 5));
+        html += `${toolCallCount > 0 ? ' · ' : ''}<span class="eval-score">${stars} ${evalScore}/5</span>`;
+      }
+      badge.innerHTML = html;
       bubble.appendChild(badge);
     }
 
