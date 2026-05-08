@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- 继承 Spring Boot 的默认配置，省去大量手动配置 -->
+    <!-- 类比 Python：from flask import Flask，这里是直接继承整个 Spring Boot 生态 -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+    </parent>
+
+    <!-- 项目基本信息，类比 package.json 里的 name/version -->
+    <groupId>com.example</groupId>
+    <artifactId>travel-agent</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>travel-agent</name>
+    <description>AI Travel Price Agent with DeepSeek</description>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot Web：提供 REST API 功能，类比 Flask -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Jackson：自动把 Java 对象转成 JSON，类比 Python 的 json 模块 -->
+        <!-- Spring Boot Web 已经包含它，这里显式声明方便用注解 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- Lombok 已移除，改为手写 getter/setter（更容易理解 Java 基础） -->
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

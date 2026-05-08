@@ -1,0 +1,15 @@
+# 密钥文件 — 绝对不能提交
+application-local.properties
+*.env
+.env
+
+# Maven 编译产物
+target/
+
+# IDE 文件
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store
