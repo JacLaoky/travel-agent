@@ -15,27 +15,15 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-
-// ════════════════════════════════════════════════════════════════
-//  Agent 核心：实现 ReAct 循环
-//
-//  流程：
-//  用户问题
-//    → 发给 DeepSeek（附带工具定义）
-//    → 如果返回 tool_calls → 执行对应工具 → 把结果加入对话 → 再次发给 DeepSeek
-//    → 如果返回 content（普通文本）→ 这是最终答案，返回给用户
-//
-//  类比 Python：就是一个 while 循环，不停和 LLM 对话直到它不再要工具
-// ════════════════════════════════════════════════════════════════
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class AgentService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentService.class);
 
-    // @Value 从 application.properties 注入配置
-    // 类比 Python：os.environ.get('DEEPSEEK_API_KEY')
     @Value("${deepseek.api.key}")
     private String apiKey;
 
@@ -45,58 +33,49 @@ public class AgentService {
     @Value("${deepseek.model}")
     private String model;
 
-    // Spring 自动注入 ToolService，不需要手动 new
-    // 类比 Python：self.tool_service = ToolService()，但 Spring 帮你做
     private final ToolService toolService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
-    // ─────────────────────────────────────────────────────────
-    // Session 存储：sessionId → 对话历史（含 system prompt）
-    // ConcurrentHashMap：线程安全，多用户并发不会冲突
-    // 类比 Python：self.sessions = {}
-    // ─────────────────────────────────────────────────────────
+    // ── Session 存储 ──────────────────────────────────────────
     private final ConcurrentHashMap<String, List<ObjectNode>> sessions = new ConcurrentHashMap<>();
 
-    // 构造函数注入（推荐方式，比 @Autowired 更清晰）
+    // ── 历史压缩阈值 ──────────────────────────────────────────
+    // 超过 COMPRESS_THRESHOLD 条消息时触发压缩
+    // 压缩后保留 system prompt + summary + 最近 KEEP_RECENT 条
+    private static final int COMPRESS_THRESHOLD = 24;
+    private static final int KEEP_RECENT        = 8;
+
     public AgentService(ToolService toolService) {
         this.toolService = toolService;
     }
 
-    // 清除指定 session（用户主动重置对话时调用）
     public void clearSession(String sessionId) {
         sessions.remove(sessionId);
         log.debug("Session cleared: {}", sessionId);
     }
 
-    // ─────────────────────────────────────────────────────────
-    // 主入口：接收用户问题，返回 Agent 最终回答
-    // ─────────────────────────────────────────────────────────
-    // 用一个简单的数组包装 int，方便在 lambda 里修改
-    // （Java lambda 里不能修改普通局部变量，这是 Java 的限制）
     public record AgentResult(String answer, int toolCallCount) {}
 
+    // ─────────────────────────────────────────────────────────
+    // 主入口：支持多轮对话
+    // ─────────────────────────────────────────────────────────
     public AgentResult chat(String userMessage, String sessionId) throws Exception {
 
-        // ── 取出或新建该 session 的对话历史 ──────────────────
-        // computeIfAbsent：如果 key 不存在，就用后面的函数创建并存入
-        // 类比 Python：messages = self.sessions.setdefault(session_id, [system_msg])
+        // 取出或新建该 session 的对话历史
         List<ObjectNode> messages = sessions.computeIfAbsent(sessionId, id -> {
-            List<ObjectNode> newHistory = new ArrayList<>();
-            // 新 session：加入 system prompt 作为第一条消息
-            ObjectNode systemMsg = objectMapper.createObjectNode();
-            systemMsg.put("role", "system");
-            systemMsg.put("content",
+            List<ObjectNode> history = new ArrayList<>();
+            ObjectNode sys = objectMapper.createObjectNode();
+            sys.put("role", "system");
+            sys.put("content",
                 "你是一个专业的旅行价格助手。用户询问旅行相关问题时，" +
                 "主动使用工具查询实时数据（汇率、天气、航班），" +
                 "综合所有信息给出具体的旅行建议。回答用中文。"
             );
-            newHistory.add(systemMsg);
-            return newHistory;
+            history.add(sys);
+            return history;
         });
 
-        // 把本轮用户消息加入历史
-        // 注意：历史里已有之前的对话，直接追加即可
         ObjectNode userMsg = objectMapper.createObjectNode();
         userMsg.put("role", "user");
         userMsg.put("content", userMessage);
@@ -104,35 +83,35 @@ public class AgentService {
 
         log.debug("Session [{}] history size: {}", sessionId, messages.size());
 
-        // ── ReAct 循环 ──────────────────────────────────────
-        int toolCallCount = 0;   // 工具调用总次数（返回给前端展示）
-        int iterations    = 0;   // 循环轮次（防止无限循环）
+        // AtomicInteger：线程安全计数器，供并行工具调用时累加
+        AtomicInteger toolCallCount = new AtomicInteger(0);
+        int iterations  = 0;
         int maxIterations = 8;
 
         while (iterations++ < maxIterations) {
 
-            // 1. 调用 DeepSeek API
+            // ① 压缩过长的历史（可能调 LLM，放在每轮开头）
+            compressHistoryIfNeeded(messages);
+
             String responseBody = callDeepSeek(messages);
             JsonNode response = objectMapper.readTree(responseBody);
-            JsonNode choice = response.get("choices").get(0);
+            JsonNode choice  = response.get("choices").get(0);
             JsonNode message = choice.get("message");
 
             String finishReason = choice.get("finish_reason").asText();
-            log.debug("finish_reason: {}, toolCallCount: {}", finishReason, toolCallCount);
+            log.debug("finish_reason={}, toolCalls so far={}", finishReason, toolCallCount.get());
 
-            // 2. 如果是最终答案（没有工具调用）→ 把答案存入历史，返回
+            // ② 最终答案：存入历史并返回
             if ("stop".equals(finishReason) || !message.has("tool_calls")) {
                 String answer = message.get("content").asText();
-                // 把 assistant 的最终回答存入 session，下轮对话能看到
                 ObjectNode finalMsg = objectMapper.createObjectNode();
                 finalMsg.put("role", "assistant");
                 finalMsg.put("content", answer);
                 messages.add(finalMsg);
-                return new AgentResult(answer, toolCallCount);
+                return new AgentResult(answer, toolCallCount.get());
             }
 
-            // 3. 有工具调用 → 执行工具，把结果加回对话
-            // 先把 assistant 的这条消息（含 tool_calls）加入历史
+            // ③ 把 assistant 的工具调用意图存入历史
             ObjectNode assistantMsg = objectMapper.createObjectNode();
             assistantMsg.put("role", "assistant");
             if (message.has("content") && !message.get("content").isNull()) {
@@ -141,37 +120,124 @@ public class AgentService {
             assistantMsg.set("tool_calls", message.get("tool_calls"));
             messages.add(assistantMsg);
 
-            // 遍历每个工具调用并执行
+            // ④ 并行执行所有工具 ────────────────────────────────
+            // 每个工具调用独立提交到 ForkJoinPool，互不等待
+            // 类比 Python：asyncio.gather(*[call_tool(t) for t in tool_calls])
+            List<CompletableFuture<ObjectNode>> futures = new ArrayList<>();
+
             for (JsonNode toolCall : message.get("tool_calls")) {
-                String toolCallId  = toolCall.get("id").asText();
-                String toolName    = toolCall.get("function").get("name").asText();
-                String toolArgsStr = toolCall.get("function").get("arguments").asText();
-                JsonNode toolArgs  = objectMapper.readTree(toolArgsStr);
+                final String toolCallId  = toolCall.get("id").asText();
+                final String toolName    = toolCall.get("function").get("name").asText();
+                final String toolArgsStr = toolCall.get("function").get("arguments").asText();
 
-                log.debug("调用工具: {} 参数: {}", toolName, toolArgsStr);
-
-                // 4. 根据工具名称执行对应方法
-                // 类比 Python：result = getattr(tool_service, tool_name)(**args)
-                String toolResult = executeTool(toolName, toolArgs);
-                toolCallCount++;
-
-                log.debug("工具结果: {}", toolResult);
-
-                // 5. 把工具结果加入对话历史，角色是 "tool"
-                ObjectNode toolResultMsg = objectMapper.createObjectNode();
-                toolResultMsg.put("role", "tool");
-                toolResultMsg.put("tool_call_id", toolCallId);
-                toolResultMsg.put("content", toolResult);
-                messages.add(toolResultMsg);
+                CompletableFuture<ObjectNode> future = CompletableFuture.supplyAsync(() -> {
+                    ObjectNode resultMsg = objectMapper.createObjectNode();
+                    resultMsg.put("role", "tool");
+                    resultMsg.put("tool_call_id", toolCallId);
+                    try {
+                        JsonNode toolArgs = objectMapper.readTree(toolArgsStr);
+                        String result = executeTool(toolName, toolArgs);
+                        log.debug("工具 [{}] 完成", toolName);
+                        resultMsg.put("content", result);
+                    } catch (Exception e) {
+                        // 工具异常不崩溃整个请求，把错误信息返给 LLM，让它自己决定下一步
+                        log.error("工具 [{}] 异常: {}", toolName, e.getMessage());
+                        resultMsg.put("content", toolName + " 暂时不可用：" + e.getMessage());
+                    }
+                    return resultMsg;
+                });
+                futures.add(future);
             }
-            // 循环继续：把工具结果发回给 DeepSeek，让它决定下一步
+
+            // 等所有工具完成（按提交顺序收结果，保证 tool_call_id 匹配）
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            for (CompletableFuture<ObjectNode> f : futures) {
+                messages.add(f.join());
+                toolCallCount.incrementAndGet();
+            }
         }
 
-        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount);
+        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount.get());
     }
 
     // ─────────────────────────────────────────────────────────
-    // 工具分发器：根据名字调用对应的工具方法
+    // 对话历史压缩
+    // 触发条件：消息数 > COMPRESS_THRESHOLD
+    // 策略：把旧消息交给 LLM 总结，只保留摘要 + 最近 KEEP_RECENT 条
+    // ─────────────────────────────────────────────────────────
+    private void compressHistoryIfNeeded(List<ObjectNode> messages) {
+        if (messages.size() <= COMPRESS_THRESHOLD) return;
+
+        log.debug("Compressing history: {} → ~{} messages", messages.size(), 2 + KEEP_RECENT);
+
+        ObjectNode systemMsg    = messages.get(0);
+        int splitPoint          = messages.size() - KEEP_RECENT;
+        List<ObjectNode> toCompress = new ArrayList<>(messages.subList(1, splitPoint));
+        List<ObjectNode> toKeep     = new ArrayList<>(messages.subList(splitPoint, messages.size()));
+
+        // 只提取 user / assistant 的文字消息（跳过 tool 结果，太长且不重要）
+        StringBuilder sb = new StringBuilder("请将以下对话历史压缩成100字以内的中文摘要，保留关键查询信息和结果：\n\n");
+        for (ObjectNode msg : toCompress) {
+            String role = msg.get("role").asText();
+            if (("user".equals(role) || "assistant".equals(role))
+                    && msg.has("content") && !msg.get("content").isNull()) {
+                String content = msg.get("content").asText();
+                if (content.length() > 200) content = content.substring(0, 200) + "...";
+                sb.append("[").append(role).append("]: ").append(content).append("\n");
+            }
+        }
+
+        try {
+            String summary = callDeepSeekSimple(sb.toString());
+
+            ObjectNode summaryMsg = objectMapper.createObjectNode();
+            summaryMsg.put("role", "system");
+            summaryMsg.put("content", "【之前对话摘要】" + summary);
+
+            messages.clear();
+            messages.add(systemMsg);
+            messages.add(summaryMsg);
+            messages.addAll(toKeep);
+
+            log.debug("Compressed to {} messages", messages.size());
+
+        } catch (Exception e) {
+            // 压缩失败就直接截断，至少不会 OOM
+            log.warn("历史压缩失败，直接截断: {}", e.getMessage());
+            messages.clear();
+            messages.add(systemMsg);
+            messages.addAll(toKeep);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 不带工具的简单 DeepSeek 调用（用于历史压缩）
+    // ─────────────────────────────────────────────────────────
+    private String callDeepSeekSimple(String userPrompt) throws Exception {
+        ObjectNode requestBody = objectMapper.createObjectNode();
+        requestBody.put("model", model);
+
+        ArrayNode messagesArray = objectMapper.createArrayNode();
+        ObjectNode msg = objectMapper.createObjectNode();
+        msg.put("role", "user");
+        msg.put("content", userPrompt);
+        messagesArray.add(msg);
+        requestBody.set("messages", messagesArray);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(apiUrl))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        return objectMapper.readTree(response.body())
+                .get("choices").get(0).get("message").get("content").asText();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 工具分发（switch → ToolService）
     // ─────────────────────────────────────────────────────────
     private String executeTool(String toolName, JsonNode args) {
         return switch (toolName) {
@@ -201,24 +267,17 @@ public class AgentService {
     // 调用 DeepSeek API（带工具定义）
     // ─────────────────────────────────────────────────────────
     private String callDeepSeek(List<ObjectNode> messages) throws Exception {
-
-        // 构建请求体（JSON）
-        // 类比 Python：payload = {"model": "...", "messages": [...], "tools": [...]}
         ObjectNode requestBody = objectMapper.createObjectNode();
         requestBody.put("model", model);
 
-        // 把 messages List 转成 JSON 数组
         ArrayNode messagesArray = objectMapper.createArrayNode();
         messages.forEach(messagesArray::add);
         requestBody.set("messages", messagesArray);
-
-        // 工具定义：告诉 DeepSeek 有哪些工具可以用，每个工具的参数是什么
         requestBody.set("tools", buildToolDefinitions());
 
         String requestBodyStr = objectMapper.writeValueAsString(requestBody);
-        log.debug("发送请求: {}", requestBodyStr);
+        log.debug("发送请求 ({} messages)", messages.size());
 
-        // 发 HTTP POST 请求
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(apiUrl))
                 .header("Content-Type", "application/json")
@@ -226,22 +285,17 @@ public class AgentService {
                 .POST(HttpRequest.BodyPublishers.ofString(requestBodyStr))
                 .build();
 
-        HttpResponse<String> response = httpClient.send(request,
-                HttpResponse.BodyHandlers.ofString());
-
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         log.debug("收到响应: {}", response.body());
         return response.body();
     }
 
     // ─────────────────────────────────────────────────────────
-    // 工具定义：用 JSON 描述每个工具的名称、用途、参数
-    // DeepSeek 根据这个定义决定要不要调用、怎么调用
-    // 这是 Function Calling / Tool Use 的核心格式（OpenAI 兼容）
+    // 工具定义（JSON Schema，告诉 DeepSeek 有哪些工具可用）
     // ─────────────────────────────────────────────────────────
     private ArrayNode buildToolDefinitions() {
         ArrayNode tools = objectMapper.createArrayNode();
 
-        // 工具1：汇率查询
         ObjectNode exchangeProps = objectMapper.createObjectNode();
         exchangeProps.set("base_currency",   buildStringProp("基础货币代码，如 CNY、SGD、USD"));
         exchangeProps.set("target_currency", buildStringProp("目标货币代码，如 JPY、THB"));
@@ -251,7 +305,6 @@ public class AgentService {
         exchangeParams.set("required", objectMapper.createArrayNode().add("base_currency").add("target_currency"));
         tools.add(buildTool("get_exchange_rate", "查询两种货币之间的实时汇率", exchangeParams));
 
-        // 工具2：天气查询
         ObjectNode weatherProps = objectMapper.createObjectNode();
         weatherProps.set("city", buildStringProp("城市名称，如 Tokyo、Bangkok、首尔"));
         ObjectNode weatherParams = objectMapper.createObjectNode();
@@ -260,7 +313,6 @@ public class AgentService {
         weatherParams.set("required", objectMapper.createArrayNode().add("city"));
         tools.add(buildTool("get_weather", "查询目的地城市未来3天的天气预报", weatherParams));
 
-        // 工具3：航班搜索
         ObjectNode flightProps = objectMapper.createObjectNode();
         flightProps.set("origin",      buildStringProp("出发城市，如 Singapore、北京"));
         flightProps.set("destination", buildStringProp("目的地城市，如 Tokyo、曼谷"));
@@ -271,7 +323,6 @@ public class AgentService {
         flightParams.set("required", objectMapper.createArrayNode().add("origin").add("destination").add("date"));
         tools.add(buildTool("search_flights", "搜索指定日期的航班和价格", flightParams));
 
-        // 工具4：费用计算
         ObjectNode costProps = objectMapper.createObjectNode();
         costProps.set("flight_price",    buildStringProp("机票价格（数字）"));
         costProps.set("hotel_per_night", buildStringProp("酒店每晚价格（数字）"));
@@ -286,7 +337,6 @@ public class AgentService {
         return tools;
     }
 
-    // 构建单个工具定义的辅助方法
     private ObjectNode buildTool(String name, String description, ObjectNode parameters) {
         ObjectNode tool = objectMapper.createObjectNode();
         tool.put("type", "function");

@@ -2,71 +2,108 @@ package com.example.agent.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import java.util.concurrent.ConcurrentHashMap;
 
-// @Service 告诉 Spring：这是一个业务逻辑组件，自动管理它的生命周期
-// 类比 Python：就是一个普通的 class，Spring 帮你 new 出来并注入到需要它的地方
 @Service
 public class ToolService {
 
+    private static final Logger log = LoggerFactory.getLogger(ToolService.class);
+
     private final HttpClient httpClient = HttpClient.newHttpClient();
-    private final ObjectMapper objectMapper = new ObjectMapper(); // JSON 工具
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // ── 汇率缓存 ──────────────────────────────────────────────
+    // API 失败时用上次成功的结果降级，不让 Agent 卡死
+    // key: "SGD_JPY"  value: "1 SGD = 110.52 JPY（缓存汇率）"
+    private final ConcurrentHashMap<String, String> rateCache = new ConcurrentHashMap<>();
+
+    // ── 自定义函数式接口（支持受检异常，Java 内置 Supplier 不支持）──
+    @FunctionalInterface
+    interface CheckedSupplier<T> {
+        T get() throws Exception;
+    }
 
     // ─────────────────────────────────────────────────────────
-    // 工具 1：获取实时汇率
-    // 调用免费 API：exchangerate-api.com（不需要 key）
-    // 类比：就是 Python 的 requests.get(url).json()
+    // 重试辅助方法
+    // 最多执行 maxRetries+1 次，失败后等待递增时间（300ms / 600ms）
+    // 全部失败时返回 fallback（可为 null → 返回错误描述）
+    // ─────────────────────────────────────────────────────────
+    private String withRetry(String toolName, CheckedSupplier<String> action, String fallback) {
+        int maxRetries = 2;
+        Exception lastEx = null;
+
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return action.get();
+            } catch (Exception e) {
+                lastEx = e;
+                log.warn("[{}] 第{}次失败: {}", toolName, attempt + 1, e.getMessage());
+                if (attempt < maxRetries) {
+                    try {
+                        Thread.sleep(300L * (attempt + 1));   // 300ms / 600ms 递增等待
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();    // 恢复中断状态，不吞掉
+                    }
+                }
+            }
+        }
+
+        log.error("[{}] 所有重试失败", toolName, lastEx);
+        // 有缓存值就降级，没有就返回友好错误信息
+        return fallback != null ? fallback
+                : toolName + " 暂时不可用，请稍后重试（" + (lastEx != null ? lastEx.getMessage() : "未知错误") + "）";
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 工具 1：汇率查询（重试 + 缓存降级）
     // ─────────────────────────────────────────────────────────
     public String getExchangeRate(String baseCurrency, String targetCurrency) {
-        try {
+        String cacheKey = baseCurrency.toUpperCase() + "_" + targetCurrency.toUpperCase();
+
+        return withRetry("汇率查询", () -> {
             String url = "https://api.exchangerate-api.com/v4/latest/" + baseCurrency.toUpperCase();
 
-            // Java 21 的 HttpClient，类比 Python requests
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
                     .build();
 
-            HttpResponse<String> response = httpClient.send(request,
-                    HttpResponse.BodyHandlers.ofString());
-
-            // 解析 JSON，类比 Python 的 response.json()["rates"]["JPY"]
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             JsonNode root = objectMapper.readTree(response.body());
             double rate = root.get("rates").get(targetCurrency.toUpperCase()).asDouble();
 
-            return String.format("1 %s = %.4f %s（实时汇率）",
+            String result = String.format("1 %s = %.4f %s（实时汇率）",
                     baseCurrency.toUpperCase(), rate, targetCurrency.toUpperCase());
 
-        } catch (Exception e) {
-            return "汇率查询失败：" + e.getMessage();
-        }
+            rateCache.put(cacheKey, result.replace("实时汇率", "缓存汇率"));  // 存缓存（标记来源）
+            return result;
+
+        }, rateCache.get(cacheKey));  // 全部重试失败时，返回缓存值（可能为 null）
     }
 
     // ─────────────────────────────────────────────────────────
-    // 工具 2：获取目的地天气预报
-    // 调用免费 API：open-meteo.com（不需要 key）
-    // 只需经纬度，东京：35.6762, 139.6503
+    // 工具 2：天气查询（重试，无缓存降级）
     // ─────────────────────────────────────────────────────────
     public String getWeather(String city) {
-        // 内置主要城市的经纬度（真实项目可以先调地理编码 API）
         String coords = switch (city.toLowerCase()) {
-            case "tokyo", "东京"       -> "35.6762,139.6503";
-            case "osaka", "大阪"       -> "34.6937,135.5023";
-            case "bangkok", "曼谷"     -> "13.7563,100.5018";
+            case "tokyo",     "东京"   -> "35.6762,139.6503";
+            case "osaka",     "大阪"   -> "34.6937,135.5023";
+            case "bangkok",   "曼谷"   -> "13.7563,100.5018";
             case "singapore", "新加坡" -> "1.3521,103.8198";
-            case "seoul", "首尔"       -> "37.5665,126.9780";
-            case "paris", "巴黎"       -> "48.8566,2.3522";
-            default                    -> "35.6762,139.6503"; // 默认东京
+            case "seoul",     "首尔"   -> "37.5665,126.9780";
+            case "paris",     "巴黎"   -> "48.8566,2.3522";
+            default                    -> "35.6762,139.6503";
         };
 
-        try {
+        return withRetry("天气查询", () -> {
             String url = String.format(
                 "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s" +
                 "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum" +
@@ -79,9 +116,7 @@ public class ToolService {
                     .GET()
                     .build();
 
-            HttpResponse<String> response = httpClient.send(request,
-                    HttpResponse.BodyHandlers.ofString());
-
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             JsonNode root   = objectMapper.readTree(response.body());
             JsonNode daily  = root.get("daily");
             JsonNode dates  = daily.get("time");
@@ -89,7 +124,6 @@ public class ToolService {
             JsonNode minT   = daily.get("temperature_2m_min");
             JsonNode precip = daily.get("precipitation_sum");
 
-            // 拼接未来3天天气摘要
             StringBuilder sb = new StringBuilder(city + " 未来3天天气：\n");
             for (int i = 0; i < 3; i++) {
                 sb.append(String.format("  %s：%s～%s°C，降水%.1fmm\n",
@@ -101,22 +135,16 @@ public class ToolService {
             }
             return sb.toString();
 
-        } catch (Exception e) {
-            return "天气查询失败：" + e.getMessage();
-        }
+        }, null);   // 天气无合适缓存，失败返回错误说明
     }
 
     // ─────────────────────────────────────────────────────────
-    // 工具 3：搜索航班（用 Amadeus 沙箱 API，有真实结构）
-    // 若没有 Amadeus key，返回模拟数据（结构一样）
+    // 工具 3：航班搜索（Mock，无需重试）
     // ─────────────────────────────────────────────────────────
     public String searchFlights(String origin, String destination, String date) {
-        // Amadeus airport codes
         String originCode = toAirportCode(origin);
         String destCode   = toAirportCode(destination);
 
-        // 模拟真实航班数据（结构和真实 API 一致）
-        // 真实项目替换成 Amadeus API 调用即可，接口不变
         return String.format(
             "%s → %s 航班搜索结果（%s）：\n" +
             "  🛫 MH612  出发08:30 抵达16:45  价格：¥2,380  马来西亚航空\n" +
@@ -128,29 +156,27 @@ public class ToolService {
     }
 
     // ─────────────────────────────────────────────────────────
-    // 工具 4：计算总费用
+    // 工具 4：费用计算（纯计算，无需重试）
     // ─────────────────────────────────────────────────────────
     public String calculateTripCost(double flightPrice, double hotelPerNight,
                                      int nights, String currency) {
         double total = flightPrice + hotelPerNight * nights;
         return String.format(
             "旅行费用估算（%s）：\n机票：%.0f\n酒店：%.0f × %d晚 = %.0f\n合计：%.0f",
-            currency, flightPrice, hotelPerNight, nights,
-            hotelPerNight * nights, total
+            currency, flightPrice, hotelPerNight, nights, hotelPerNight * nights, total
         );
     }
 
-    // ─── 辅助方法 ───
     private String toAirportCode(String city) {
         return switch (city.toLowerCase()) {
             case "singapore", "新加坡", "sin" -> "SIN";
-            case "tokyo", "东京", "nrt"       -> "NRT";
-            case "osaka", "大阪", "kix"       -> "KIX";
-            case "bangkok", "曼谷", "bkk"     -> "BKK";
-            case "seoul", "首尔", "icn"       -> "ICN";
-            case "hong kong", "香港", "hkg"   -> "HKG";
-            case "beijing", "北京", "pek"     -> "PEK";
-            case "shanghai", "上海", "pvg"    -> "PVG";
+            case "tokyo",     "东京",   "nrt" -> "NRT";
+            case "osaka",     "大阪",   "kix" -> "KIX";
+            case "bangkok",   "曼谷",   "bkk" -> "BKK";
+            case "seoul",     "首尔",   "icn" -> "ICN";
+            case "hong kong", "香港",   "hkg" -> "HKG";
+            case "beijing",   "北京",   "pek" -> "PEK";
+            case "shanghai",  "上海",   "pvg" -> "PVG";
             default -> city.toUpperCase().substring(0, Math.min(3, city.length()));
         };
     }
