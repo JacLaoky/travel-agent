@@ -15,6 +15,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 // ════════════════════════════════════════════════════════════════
 //  Agent 核心：实现 ReAct 循环
@@ -50,9 +51,22 @@ public class AgentService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
+    // ─────────────────────────────────────────────────────────
+    // Session 存储：sessionId → 对话历史（含 system prompt）
+    // ConcurrentHashMap：线程安全，多用户并发不会冲突
+    // 类比 Python：self.sessions = {}
+    // ─────────────────────────────────────────────────────────
+    private final ConcurrentHashMap<String, List<ObjectNode>> sessions = new ConcurrentHashMap<>();
+
     // 构造函数注入（推荐方式，比 @Autowired 更清晰）
     public AgentService(ToolService toolService) {
         this.toolService = toolService;
+    }
+
+    // 清除指定 session（用户主动重置对话时调用）
+    public void clearSession(String sessionId) {
+        sessions.remove(sessionId);
+        log.debug("Session cleared: {}", sessionId);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -62,27 +76,33 @@ public class AgentService {
     // （Java lambda 里不能修改普通局部变量，这是 Java 的限制）
     public record AgentResult(String answer, int toolCallCount) {}
 
-    public AgentResult chat(String userMessage) throws Exception {
+    public AgentResult chat(String userMessage, String sessionId) throws Exception {
 
-        // messages 是对话历史，每轮都要带上
-        // 类比 Python：messages = [{"role": "system", ...}, {"role": "user", ...}]
-        List<ObjectNode> messages = new ArrayList<>();
+        // ── 取出或新建该 session 的对话历史 ──────────────────
+        // computeIfAbsent：如果 key 不存在，就用后面的函数创建并存入
+        // 类比 Python：messages = self.sessions.setdefault(session_id, [system_msg])
+        List<ObjectNode> messages = sessions.computeIfAbsent(sessionId, id -> {
+            List<ObjectNode> newHistory = new ArrayList<>();
+            // 新 session：加入 system prompt 作为第一条消息
+            ObjectNode systemMsg = objectMapper.createObjectNode();
+            systemMsg.put("role", "system");
+            systemMsg.put("content",
+                "你是一个专业的旅行价格助手。用户询问旅行相关问题时，" +
+                "主动使用工具查询实时数据（汇率、天气、航班），" +
+                "综合所有信息给出具体的旅行建议。回答用中文。"
+            );
+            newHistory.add(systemMsg);
+            return newHistory;
+        });
 
-        // System prompt：告诉 Agent 它的角色和能力
-        ObjectNode systemMsg = objectMapper.createObjectNode();
-        systemMsg.put("role", "system");
-        systemMsg.put("content",
-            "你是一个专业的旅行价格助手。用户询问旅行相关问题时，" +
-            "主动使用工具查询实时数据（汇率、天气、航班），" +
-            "综合所有信息给出具体的旅行建议。回答用中文。"
-        );
-        messages.add(systemMsg);
-
-        // 用户消息
+        // 把本轮用户消息加入历史
+        // 注意：历史里已有之前的对话，直接追加即可
         ObjectNode userMsg = objectMapper.createObjectNode();
         userMsg.put("role", "user");
         userMsg.put("content", userMessage);
         messages.add(userMsg);
+
+        log.debug("Session [{}] history size: {}", sessionId, messages.size());
 
         // ── ReAct 循环 ──────────────────────────────────────
         int toolCallCount = 0;   // 工具调用总次数（返回给前端展示）
@@ -100,9 +120,15 @@ public class AgentService {
             String finishReason = choice.get("finish_reason").asText();
             log.debug("finish_reason: {}, toolCallCount: {}", finishReason, toolCallCount);
 
-            // 2. 如果是最终答案（没有工具调用）→ 直接返回
+            // 2. 如果是最终答案（没有工具调用）→ 把答案存入历史，返回
             if ("stop".equals(finishReason) || !message.has("tool_calls")) {
-                return new AgentResult(message.get("content").asText(), toolCallCount);
+                String answer = message.get("content").asText();
+                // 把 assistant 的最终回答存入 session，下轮对话能看到
+                ObjectNode finalMsg = objectMapper.createObjectNode();
+                finalMsg.put("role", "assistant");
+                finalMsg.put("content", answer);
+                messages.add(finalMsg);
+                return new AgentResult(answer, toolCallCount);
             }
 
             // 3. 有工具调用 → 执行工具，把结果加回对话

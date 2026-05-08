@@ -21,16 +21,26 @@ public class AgentController {
     }
 
     // POST /api/agent/chat
-    // 类比 Flask：@app.route('/api/agent/chat', methods=['POST'])
     @PostMapping("/chat")
     public ResponseEntity<ChatResponse> chat(@RequestBody ChatRequest request) {
         try {
-            AgentService.AgentResult result = agentService.chat(request.getMessage());
+            // sessionId 为空时用 "default"，保证向后兼容
+            String sessionId = (request.getSessionId() != null && !request.getSessionId().isBlank())
+                    ? request.getSessionId()
+                    : "default";
+            AgentService.AgentResult result = agentService.chat(request.getMessage(), sessionId);
             return ResponseEntity.ok(new ChatResponse(result.answer(), result.toolCallCount()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(new ChatResponse("服务器错误：" + e.getMessage(), 0));
         }
+    }
+
+    // DELETE /api/agent/session/{sessionId} — 清除指定会话历史（开始新对话）
+    @DeleteMapping("/session/{sessionId}")
+    public ResponseEntity<String> clearSession(@PathVariable String sessionId) {
+        agentService.clearSession(sessionId);
+        return ResponseEntity.ok("Session cleared: " + sessionId);
     }
 
     // GET /api/agent/health — 健康检查，确认服务在跑
