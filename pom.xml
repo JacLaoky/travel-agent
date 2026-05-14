@@ -37,6 +37,13 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
 
+        <!-- Redis：用于长期记忆持久化，替代内存 ConcurrentHashMap -->
+        <!-- StringRedisTemplate 负责 key-value 读写，自动序列化为字符串 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <!-- Lombok 已移除，改为手写 getter/setter（更容易理解 Java 基础） -->
     </dependencies>
 

@@ -144,6 +144,19 @@
   }
   .eval-score { color: #f57c00; font-weight: 600; }
 
+  /* 记忆提示条 */
+  .memory-bar {
+    background: #fff8e1;
+    border-bottom: 1px solid #ffe082;
+    padding: 6px 20px;
+    font-size: 12px;
+    color: #795548;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .memory-bar.hidden { display: none; }
+
   /* 加载动画 */
   .loading-bubble {
     background: #f8f9fa;
@@ -218,6 +231,11 @@
     <button class="new-chat-btn" onclick="newChat()">+ 新对话</button>
   </div>
 
+  <!-- Memory hint bar -->
+  <div class="memory-bar hidden" id="memory-bar">
+    <span>🧠</span><span id="memory-text"></span>
+  </div>
+
   <!-- Messages -->
   <div class="messages" id="messages">
     <div class="welcome" id="welcome">
@@ -252,7 +270,8 @@
 
 <script>
   // ── Session 管理 ─────────────────────────────────────────────
-  // sessionId 存在 localStorage，刷新页面后继续同一对话
+  // sessionId：短期会话 ID，new-chat 时会重置
+  // userId：长期用户 ID，跨 session 不变，用于长期记忆
   function getSessionId() {
     let id = localStorage.getItem('travel_session_id');
     if (!id) {
@@ -262,12 +281,30 @@
     return id;
   }
 
+  function getUserId() {
+    let id = localStorage.getItem('travel_user_id');
+    if (!id) {
+      id = 'user_' + Math.random().toString(36).substr(2, 12);
+      localStorage.setItem('travel_user_id', id);
+    }
+    return id;
+  }
+
+  function showMemoryBar(text) {
+    const bar = document.getElementById('memory-bar');
+    document.getElementById('memory-text').textContent = text;
+    bar.classList.remove('hidden');
+    // 3 秒后自动隐藏
+    setTimeout(() => bar.classList.add('hidden'), 3000);
+  }
+
   function newChat() {
     const sessionId = getSessionId();
     fetch(`/api/agent/session/${sessionId}`, { method: 'DELETE' })
       .finally(() => {
-        // 无论删除成功与否，生成新 sessionId 并清空页面
+        // 仅清除 sessionId，保留 userId（长期记忆不重置）
         localStorage.removeItem('travel_session_id');
+        document.getElementById('memory-bar').classList.add('hidden');
         document.getElementById('messages').innerHTML = `
           <div class="welcome" id="welcome">
             <div class="icon">🌏</div>
@@ -316,13 +353,17 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         message: text,
-        sessionId: getSessionId()
+        sessionId: getSessionId(),
+        userId: getUserId()
       })
     })
     .then(r => r.json())
     .then(data => {
       removeLoading(loadingId);
       appendMessage('assistant', data.answer, data.toolCallCount, data.evalScore);
+      if (data.memoryUsed) {
+        showMemoryBar('已应用你的旅行偏好记忆：' + data.memoryUsed.substring(0, 60) + (data.memoryUsed.length > 60 ? '…' : ''));
+      }
     })
     .catch(err => {
       removeLoading(loadingId);

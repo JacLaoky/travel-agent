@@ -7,12 +7,13 @@ public class ChatRequest {
 
     private String message;
     private String sessionId;
+    private String userId;   // 跨 session 的稳定标识，用于长期记忆（可选）
 
-    // getter：Spring 的 JSON 反序列化需要这些方法
     public String getMessage()   { return message; }
     public String getSessionId() { return sessionId; }
+    public String getUserId()    { return userId; }
 
-    // setter：Jackson 把 JSON 映射到对象时调用
     public void setMessage(String message)     { this.message = message; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+    public void setUserId(String userId)       { this.userId = userId; }
 }

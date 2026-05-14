@@ -34,20 +34,25 @@ public class AgentService {
     private String model;
 
     private final ToolService toolService;
+    private final MemoryService memoryService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
-    // ── Session 存储 ──────────────────────────────────────────
+    // ── Session 存储（短期记忆：单次对话历史）────────────────────
     private final ConcurrentHashMap<String, List<ObjectNode>> sessions = new ConcurrentHashMap<>();
 
     // ── 历史压缩阈值 ──────────────────────────────────────────
-    // 超过 COMPRESS_THRESHOLD 条消息时触发压缩
-    // 压缩后保留 system prompt + summary + 最近 KEEP_RECENT 条
     private static final int COMPRESS_THRESHOLD = 24;
     private static final int KEEP_RECENT        = 8;
 
-    public AgentService(ToolService toolService) {
-        this.toolService = toolService;
+    private static final String BASE_SYSTEM_PROMPT =
+        "你是一个专业的旅行价格助手。用户询问旅行相关问题时，" +
+        "主动使用工具查询实时数据（汇率、天气、航班），" +
+        "综合所有信息给出具体的旅行建议。回答用中文。";
+
+    public AgentService(ToolService toolService, MemoryService memoryService) {
+        this.toolService   = toolService;
+        this.memoryService = memoryService;
     }
 
     public void clearSession(String sessionId) {
@@ -55,7 +60,7 @@ public class AgentService {
         log.debug("Session cleared: {}", sessionId);
     }
 
-    public record AgentResult(String answer, int toolCallCount, int evalScore) {}
+    public record AgentResult(String answer, int toolCallCount, int evalScore, String memoryUsed) {}
 
     // 自评结果：分数(1-5) + 批评意见
     private record EvalResult(int score, String critique) {}
@@ -63,21 +68,33 @@ public class AgentService {
     // ─────────────────────────────────────────────────────────
     // 主入口：支持多轮对话
     // ─────────────────────────────────────────────────────────
-    public AgentResult chat(String userMessage, String sessionId) throws Exception {
+    public AgentResult chat(String userMessage, String sessionId, String userId) throws Exception {
 
-        // 取出或新建该 session 的对话历史
+        // ── 取出或新建该 session 的对话历史 ──────────────────────
+        // 新建时：注入长期记忆（如果该用户有历史记录）
+        final String resolvedUserId = (userId != null && !userId.isBlank()) ? userId : null;
+
         List<ObjectNode> messages = sessions.computeIfAbsent(sessionId, id -> {
             List<ObjectNode> history = new ArrayList<>();
+
+            String memContent = resolvedUserId != null ? memoryService.get(resolvedUserId) : "";
+            String sysContent = BASE_SYSTEM_PROMPT;
+
+            // 有长期记忆 → 追加进 system prompt，让 LLM 知道用户历史偏好
+            if (!memContent.isBlank()) {
+                sysContent += "\n\n【该用户的历史偏好】" + memContent;
+                log.debug("Memory injected for [{}]: {}", resolvedUserId, memContent);
+            }
+
             ObjectNode sys = objectMapper.createObjectNode();
             sys.put("role", "system");
-            sys.put("content",
-                "你是一个专业的旅行价格助手。用户询问旅行相关问题时，" +
-                "主动使用工具查询实时数据（汇率、天气、航班），" +
-                "综合所有信息给出具体的旅行建议。回答用中文。"
-            );
+            sys.put("content", sysContent);
             history.add(sys);
             return history;
         });
+
+        // 记录本次是否使用了记忆（用于返回给前端展示）
+        String memoryUsed = (resolvedUserId != null) ? memoryService.get(resolvedUserId) : "";
 
         ObjectNode userMsg = objectMapper.createObjectNode();
         userMsg.put("role", "user");
@@ -146,7 +163,18 @@ public class AgentService {
                     }
                 }
 
-                return new AgentResult(answer, toolCallCount.get(), evalScore);
+                // ── 异步提取长期记忆（不阻塞响应）────────────────
+                // 把本次对话里的关键事实提取出来，合并进用户的长期记忆
+                if (resolvedUserId != null) {
+                    final List<ObjectNode> msgSnapshot = new ArrayList<>(messages);
+                    final String existingMemory = memoryService.get(resolvedUserId);
+                    CompletableFuture.runAsync(() ->
+                        extractAndSaveMemory(resolvedUserId, msgSnapshot, existingMemory)
+                    );
+                }
+
+                return new AgentResult(answer, toolCallCount.get(), evalScore,
+                        memoryUsed.isBlank() ? null : memoryUsed);
             }
 
             // ③ 把 assistant 的工具调用意图存入历史
@@ -195,7 +223,7 @@ public class AgentService {
             }
         }
 
-        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount.get(), 0);
+        return new AgentResult("抱歉，处理超时，请换个方式提问。", toolCallCount.get(), 0, null);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -245,6 +273,42 @@ public class AgentService {
             messages.clear();
             messages.add(systemMsg);
             messages.addAll(toKeep);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 长期记忆提取（异步调用，不影响主流程）
+    // 从本次对话中提取用户偏好，合并进已有记忆后存入 MemoryService
+    // ─────────────────────────────────────────────────────────
+    private void extractAndSaveMemory(String userId, List<ObjectNode> messages, String existing) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (ObjectNode msg : messages) {
+                String role = msg.get("role").asText();
+                if (("user".equals(role) || "assistant".equals(role))
+                        && msg.has("content") && !msg.get("content").isNull()) {
+                    String content = msg.get("content").asText();
+                    if (content.length() > 200) content = content.substring(0, 200) + "...";
+                    sb.append("[").append(role).append("]: ").append(content).append("\n");
+                }
+            }
+
+            String prompt = String.format(
+                "从以下旅行查询对话中提取用户的关键信息（常用出发城市、预算偏好、常查路线、偏好航空公司等）。\n" +
+                "已有记忆：%s\n\n" +
+                "新对话：\n%s\n\n" +
+                "将新信息合并到已有记忆，用一句话（不超过80字）输出更新后的记忆。\n" +
+                "如果没有新的有用信息，原样返回已有记忆。如果完全没有信息，回复\"无\"。",
+                existing.isBlank() ? "无" : existing,
+                sb.toString()
+            );
+
+            String result = callDeepSeekSimple(prompt);
+            if (result != null && !result.isBlank() && !"无".equals(result.trim())) {
+                memoryService.update(userId, result.trim());
+            }
+        } catch (Exception e) {
+            log.warn("Memory extraction failed for [{}]: {}", userId, e.getMessage());
         }
     }
 
